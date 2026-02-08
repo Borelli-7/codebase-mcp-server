@@ -1,8 +1,9 @@
 import fs from 'fs/promises';
 import path from 'path';
-import ignore from 'ignore';
 import type { Ignore } from 'ignore';
 import { ConfigManager } from './config.js';
+import { Neo4jService } from './neo4jService.js';
+import { initializeIgnoreFilter, detectLanguage, matchesPattern } from './utils.js';
 
 export interface FileInfo {
   path: string;
@@ -42,51 +43,12 @@ export interface ModuleDependencies {
 
 export class CodebaseLoader {
   private configManager: ConfigManager;
+  private neo4jService: Neo4jService | null = null;
   private ignoreFilter: Ignore | null = null;
 
-  // Language mappings by file extension
-  private static readonly LANGUAGE_MAP: Record<string, string> = {
-    '.ts': 'typescript',
-    '.tsx': 'typescript',
-    '.js': 'javascript',
-    '.jsx': 'javascript',
-    '.py': 'python',
-    '.java': 'java',
-    '.go': 'go',
-    '.rs': 'rust',
-    '.cpp': 'cpp',
-    '.cc': 'cpp',
-    '.cxx': 'cpp',
-    '.c': 'c',
-    '.h': 'c',
-    '.hpp': 'cpp',
-    '.cs': 'csharp',
-    '.rb': 'ruby',
-    '.php': 'php',
-    '.swift': 'swift',
-    '.kt': 'kotlin',
-    '.scala': 'scala',
-    '.sh': 'shell',
-    '.bash': 'shell',
-    '.zsh': 'shell',
-    '.md': 'markdown',
-    '.json': 'json',
-    '.yaml': 'yaml',
-    '.yml': 'yaml',
-    '.xml': 'xml',
-    '.html': 'html',
-    '.css': 'css',
-    '.scss': 'scss',
-    '.sql': 'sql',
-    '.r': 'r',
-    '.m': 'matlab',
-    '.dart': 'dart',
-    '.vue': 'vue',
-    '.svelte': 'svelte'
-  };
-
-  constructor(configManager: ConfigManager) {
+  constructor(configManager: ConfigManager, neo4jService?: Neo4jService) {
     this.configManager = configManager;
+    this.neo4jService = neo4jService || null;
   }
 
   /**
@@ -105,55 +67,78 @@ export class CodebaseLoader {
    * Initialize ignore filter from .gitignore and custom patterns
    */
   private async initializeIgnoreFilter(baseDir: string): Promise<void> {
-    this.ignoreFilter = ignore.default();
-
-    // Add default patterns
-    const defaultPatterns = [
-      'node_modules',
-      '.git',
-      'dist',
-      'build',
-      'out',
-      'target',
-      '.next',
-      '.nuxt',
-      'coverage',
-      '.nyc_output',
-      '*.log',
-      '.DS_Store',
-      'Thumbs.db'
-    ];
-
-    this.ignoreFilter.add(defaultPatterns);
-
-    // Add custom patterns from config
-    const customPatterns = this.configManager.getIgnorePatterns();
-    if (customPatterns.length > 0) {
-      this.ignoreFilter.add(customPatterns);
-    }
-
-    // Try to load .gitignore if it exists
-    try {
-      const gitignorePath = path.join(baseDir, '.gitignore');
-      const gitignoreContent = await fs.readFile(gitignorePath, 'utf-8');
-      this.ignoreFilter.add(gitignoreContent);
-    } catch {
-      // .gitignore doesn't exist or couldn't be read, continue without it
-    }
+    this.ignoreFilter = await initializeIgnoreFilter(
+      baseDir,
+      this.configManager.getIgnorePatterns()
+    );
   }
 
   /**
-   * Detect language from file extension
-   */
-  private detectLanguage(filePath: string): string {
-    const ext = path.extname(filePath).toLowerCase();
-    return CodebaseLoader.LANGUAGE_MAP[ext] || 'unknown';
-  }
-
-  /**
-   * Get codebase structure
+   * Get codebase structure (Neo4j-aware with filesystem fallback)
    */
   async getStructure(maxDepth: number = 3, includeHidden: boolean = false): Promise<CodebaseStructure> {
+    const baseDir = this.configManager.getCodebasePath();
+    if (!baseDir) {
+      throw new Error('No codebase path configured');
+    }
+
+    // Try Neo4j first if available
+    if (this.neo4jService?.isConnected()) {
+      try {
+        return await this.getStructureFromGraph(maxDepth);
+      } catch (error) {
+        console.error('[CodebaseLoader] Neo4j query failed, falling back to filesystem');
+      }
+    }
+
+    // Fallback to filesystem
+    return await this.getStructureFromFilesystem(maxDepth, includeHidden);
+  }
+
+  /**
+   * Get structure from Neo4j graph
+   */
+  private async getStructureFromGraph(maxDepth: number): Promise<CodebaseStructure> {
+    const baseDir = this.configManager.getCodebasePath();
+    if (!baseDir || !this.neo4jService) {
+      throw new Error('Neo4j not available');
+    }
+
+    const result = await this.neo4jService.executeRead(
+      `MATCH path = (c:Codebase { path: $basePath })-[:ROOT_DIR|CONTAINS*1..${maxDepth}]->(n)
+       WHERE n:File OR n: Directory
+       RETURN n.path as path, n.name as name, 
+              CASE WHEN n:File THEN 'file' ELSE 'directory' END as type,
+              n.size as size, n.language as language,
+              length(path) - 1 as depth
+       ORDER BY depth, path`,
+      { basePath: baseDir }
+    );
+
+    const items: FileInfo[] = result.records.map(record => {
+      const item: FileInfo = {
+        path: record.get('path'),
+        type: record.get('type') as 'file' | 'directory'
+      };
+      
+      if (item.type === 'file') {
+        item.size = record.get('size')?.toNumber() || 0;
+        item.language = record.get('language') || 'unknown';
+      }
+      
+      return item;
+    });
+
+    const totalFiles = items.filter(i => i.type === 'file').length;
+    const totalDirectories = items.filter(i => i.type === 'directory').length;
+
+    return { items, totalFiles, totalDirectories };
+  }
+
+  /**
+   * Get structure from filesystem
+   */
+  private async getStructureFromFilesystem(maxDepth: number, includeHidden: boolean): Promise<CodebaseStructure> {
     const baseDir = this.configManager.getCodebasePath();
     if (!baseDir) {
       throw new Error('No codebase path configured');
@@ -200,7 +185,7 @@ export class CodebaseLoader {
             path: relativePath,
             type: 'file',
             size: stats.size,
-            language: this.detectLanguage(entry.name)
+            language: detectLanguage(entry.name)
           });
         }
       }
@@ -246,7 +231,7 @@ export class CodebaseLoader {
     return {
       path: relativePath,
       content,
-      language: this.detectLanguage(relativePath),
+      language: detectLanguage(relativePath),
       lines,
       size: stats.size
     };
@@ -290,7 +275,7 @@ export class CodebaseLoader {
           await searchInDirectory(fullPath);
         } else if (entry.isFile()) {
           // Check file pattern filter
-          if (filePattern && !this.matchesPattern(entry.name, filePattern)) {
+          if (filePattern && !matchesPattern(entry.name, filePattern)) {
             continue;
           }
 
@@ -338,18 +323,7 @@ export class CodebaseLoader {
     return results;
   }
 
-  /**
-   * Check if filename matches pattern
-   */
-  private matchesPattern(filename: string, pattern: string): boolean {
-    // Simple glob pattern matching
-    const regexPattern = pattern
-      .replace(/\./g, '\\.')
-      .replace(/\*/g, '.*')
-      .replace(/\?/g, '.');
-    const regex = new RegExp(`^${regexPattern}$`, 'i');
-    return regex.test(filename);
-  }
+
 
   /**
    * Get module dependencies
