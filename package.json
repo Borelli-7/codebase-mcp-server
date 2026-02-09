@@ -11,6 +11,8 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "watch": "tsc --watch",
     "prepare": "npm run build"
   },
@@ -26,14 +28,16 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
-    "codebase-mcp-server": "^1.0.0",
+    "dotenv": "^16.4.7",
     "ignore": "^6.0.2",
+    "neo4j-driver": "^5.27.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.5"
   },
   "engines": {
     "node": ">=18.0.0"

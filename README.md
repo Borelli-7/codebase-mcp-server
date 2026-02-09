@@ -8,6 +8,10 @@ A Model Context Protocol (MCP) server that intelligently loads and contextualize
 - **Multi-Module Support**: Handles monorepos and complex project structures
 - **Smart Traversal**: Respects `.gitignore` and custom ignore patterns
 - **Dependency Analysis**: Automatically detects and parses dependencies from package.json, pom.xml, Cargo.toml, go.mod
+- **Neo4j Graph Database** (Optional): Persistent graph-based indexing for advanced codebase analysis
+  - Automatic indexing on codebase load
+  - Graph-powered queries for relationships and dependencies
+  - Graceful fallback to filesystem-only mode
 - **IDE Integration**: Works seamlessly with VS Code and IntelliJ IDEA
 - **Efficient Search**: Fast file and content search capabilities
 - **Context-Aware**: Provides structured information about your codebase to AI assistants
@@ -80,6 +84,45 @@ Follow the setup guides for your preferred editor:
 ## ⚙️ Configuration
 
 The server can be configured through MCP tool calls or environment variables.
+
+### Neo4j Integration (Optional)
+
+Enable persistent graph-based indexing by configuring Neo4j via environment variables:
+
+```bash
+# Quick setup with Docker
+docker run -d --name neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/your-password \
+  neo4j:5
+
+# Set environment variables
+export NEO4J_URI=bolt://localhost:7687
+export NEO4J_USER=neo4j
+export NEO4J_PASSWORD=your-password
+export NEO4J_DATABASE=neo4j  # Optional, default: neo4j
+```
+
+Or create a `.env` file in the project root:
+
+```bash
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your-password
+NEO4J_DATABASE=neo4j
+```
+
+See [.env.example](.env.example) for configuration templates.
+
+**When Neo4j is enabled:**
+- Codebase is automatically indexed on `set-codebase-path`
+- Graph queries provide enhanced performance for structure and search operations
+- New graph-powered tools become available
+
+**When Neo4j is not configured:**
+- Server runs in filesystem-only mode
+- All original tools work unchanged
+- No performance impact
 
 ### Default Ignore Patterns
 
@@ -262,6 +305,106 @@ Add, remove, or list ignore patterns for file traversal.
 }
 ```
 
+---
+
+## 🔷 Neo4j-Powered Tools
+
+The following tools are available when Neo4j is configured:
+
+### 7. index-codebase
+
+Manually trigger re-indexing of the current codebase into Neo4j.
+
+**Input Schema:**
+```typescript
+{
+  force?: boolean  // Force re-index even if already indexed
+}
+```
+
+**Output Schema:**
+```typescript
+{
+  success: boolean
+  totalFiles: number
+  totalDirectories: number
+  totalDependencies: number
+  duration: number  // milliseconds
+}
+```
+
+### 8. get-codebase-stats
+
+Get aggregate statistics from the indexed codebase graph.
+
+**Input Schema:**
+```typescript
+{}
+```
+
+**Output Schema:**
+```typescript
+{
+  success: boolean
+  indexedAt: string
+  totalFiles: number
+  totalDirectories: number
+  totalDependencies: number
+  topLanguages: Array<{
+    language: string
+    count: number
+  }>
+  totalSize: number
+}
+```
+
+### 9. get-dependency-graph
+
+Retrieve the complete dependency graph from Neo4j.
+
+**Input Schema:**
+```typescript
+{
+  depth?: number  // Maximum depth for dependency tree (default: all)
+}
+```
+
+**Output Schema:**
+```typescript
+{
+  success: boolean
+  dependencies: Array<{
+    name: string
+    version: string
+    type: 'runtime' | 'dev' | 'peer' | 'optional'
+  }>
+  totalCount: number
+}
+```
+
+### 10. get-directory-summary
+
+Get aggregate statistics for a specific directory from the graph.
+
+**Input Schema:**
+```typescript
+{
+  dirPath: string  // Relative path to directory
+}
+```
+
+**Output Schema:**
+```typescript
+{
+  success: boolean
+  path: string
+  totalFiles: number
+  languages: Record<string, number>  // language -> file count
+  totalSize: number
+  totalLines: number
+}
+```
+
 ## 🖥️ Editor Integration
 
 ### VS Code
@@ -348,9 +491,12 @@ See the [IntelliJ IDEA Setup Guide](INTELLIJ_SETUP.md) for detailed instructions
    - Handles MCP protocol communication
    - Registers and exposes tools
    - Uses stdio transport
+   - Wires Neo4j integration (optional)
 
 2. **Codebase Loader** (`src/codebaseLoader.ts`)
-   - File system traversal
+   - File system traversal with dual-source strategy
+   - Neo4j graph queries (when available)
+   - Automatic fallback to filesystem
    - Language detection
    - Content parsing
    - Dependency analysis
@@ -358,6 +504,24 @@ See the [IntelliJ IDEA Setup Guide](INTELLIJ_SETUP.md) for detailed instructions
 3. **Config Manager** (`src/config.ts`)
    - Configuration state management
    - Ignore pattern management
+   - Neo4j configuration from environment
+
+4. **Neo4j Service** (`src/neo4jService.ts`) *[Optional]*
+   - Database connection management
+   - Cypher query execution helpers
+   - Schema initialization (constraints & indexes)
+   - Graceful error handling
+
+5. **Neo4j Indexer** (`src/neo4jIndexer.ts`) *[Optional]*
+   - Batch indexing pipeline (500 items/batch)
+   - Graph node/relationship creation
+   - Dependency parsing integration
+   - Performance-optimized for large codebases
+
+6. **Utilities** (`src/utils.ts`)
+   - Ignore filter initialization
+   - Language detection (37+ extensions)
+   - Pattern matching
 
 ### Supported Languages
 
@@ -385,6 +549,9 @@ Automatically parses dependency files:
 
 - Node.js 18.0.0 or higher
 - npm or yarn
+- Neo4j 5.x (optional, for graph-based features)
+  - Docker: `docker run -d --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j:5`
+  - Or install locally from [neo4j.com/download](https://neo4j.com/download/)
 
 ### Setup
 
@@ -412,11 +579,18 @@ npm run watch
 codebase-mcp-server/
 ├── src/
 │   ├── index.ts              # Main MCP server
-│   ├── codebaseLoader.ts     # Codebase loading logic
-│   └── config.ts             # Configuration management
+│   ├── codebaseLoader.ts     # Codebase loading logic (dual-source)
+│   ├── config.ts             # Configuration management
+│   ├── neo4jService.ts       # Neo4j connection & queries
+│   ├── neo4jIndexer.ts       # Graph indexing pipeline
+│   └── utils.ts              # Shared utilities
+├── tests/
+│   └── utils.test.ts         # Unit tests
 ├── dist/                     # Compiled output
+├── .env.example              # Environment variable template
 ├── VSCODE_SETUP.md          # VS Code integration guide
 ├── INTELLIJ_SETUP.md        # IntelliJ IDEA integration guide
+├── vitest.config.ts         # Test configuration
 ├── package.json
 ├── tsconfig.json
 └── README.md
@@ -428,6 +602,8 @@ codebase-mcp-server/
 - `npm run dev` - Run in development mode with tsx
 - `npm run watch` - Watch mode for development
 - `npm start` - Run the compiled server
+- `npm test` - Run tests with vitest
+- `npm run test:watch` - Run tests in watch mode
 
 ## 🐛 Troubleshooting
 
@@ -476,10 +652,44 @@ chmod +x dist/index.js
 
 For large codebases:
 
-1. Add more ignore patterns
-2. Limit `maxDepth` when listing structure
-3. Use specific file patterns in searches
-4. Set codebase path to specific modules
+1. **Enable Neo4j** for persistent indexing and faster queries
+2. Add more ignore patterns
+3. Limit `maxDepth` when listing structure
+4. Use specific file patterns in searches
+5. Set codebase path to specific modules
+
+### Neo4j Connection Issues
+
+**Server not connecting to Neo4j:**
+
+1. Verify Neo4j is running:
+   ```bash
+   docker ps | grep neo4j
+   # or
+   neo4j status
+   ```
+
+2. Test connection:
+   ```bash
+   # Check Neo4j browser at http://localhost:7474
+   ```
+
+3. Verify environment variables:
+   ```bash
+   echo $NEO4J_URI
+   echo $NEO4J_USER
+   echo $NEO4J_PASSWORD
+   ```
+
+4. Check server logs (stderr):
+   - Look for `[Neo4j] Connected successfully` or connection errors
+   - Server will fall back to filesystem-only mode on connection failure
+
+**Indexing performance:**
+
+- First indexing may take time for large codebases (10k+ files: ~20-30s)
+- Subsequent queries use the graph and are much faster
+- Use `index-codebase` tool to manually re-index after major changes
 
 ### Debug Logging
 
